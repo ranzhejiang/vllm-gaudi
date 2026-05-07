@@ -619,6 +619,19 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         super().__init__(global_num_experts, num_total_experts, experts_min, experts_max, bias, dispatch_fn)
         self.w13_list = torch.nn.ModuleList([MoeMatmul() for _ in range(num_total_experts)])
         self.w2_list = torch.nn.ModuleList([MoeMatmul() for _ in range(num_total_experts)])
+        self.w13_raw = None
+        self.w2_raw = None
+
+    def custom_gateup_activation(self, gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+        """
+        gate_up: [N, 2*D] (last dim is the concated gate and up )
+        return:  [N, D]
+        """
+        gate, up = gate_up.chunk(2, dim=-1)     # chunk last dim
+        gate = F.silu(gate)
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        return gate * up
 
     def forward(self, hidden_states, expert_routing_table, router_weights, permuted_weights=True, activation="silu"):
         tokens_num, _ = hidden_states.shape
@@ -628,7 +641,69 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         w1_list = [self.w13_list[i].weight.squeeze() for i in experts_range]
         w2_list = [self.w2_list[i].weight.squeeze() for i in experts_range]
 
-        if self.moe_n_slice == 1:
+        # swiglustep not support on torch.ops.hpu.mixture_of_experts
+        if(activation == "swiglustep"):
+            T, H = hidden_states.shape
+            device = hidden_states.device
+            dtype = hidden_states.dtype  # expected bf16
+            E_local = len(self.w1_list) # the number of local experts
+            
+            # ------------------------------------------------------------
+            # 1) get the full raw moe bf16 weight and shape
+            # ------------------------------------------------------------
+            W13 = self.w13_raw
+            W2 = self.w2_raw
+            twoD = W13.size(1)
+            D = twoD // 2
+
+            # ------------------------------------------------------------
+            # 2) create the global experts_mask: [E_local, T, 1]
+            #    the slice it to got the experts_mask_local
+            # ------------------------------------------------------------
+            if expert_routing_table.dim() == 1:
+                topk_ids = expert_routing_table.view(T, 1)
+            else:
+                topk_ids = expert_routing_table  # [T,K]
+
+            if router_weights.dim() == 1:
+                topk_w = router_weights.view(T, 1).to(dtype)
+            else:
+                topk_w = router_weights.to(dtype)
+
+            experts_mask = torch.zeros((T, self.global_num_experts), dtype=dtype, device=device)
+            experts_mask.scatter_(-1, topk_ids.long(), topk_w)
+            experts_mask = experts_mask.transpose(0, 1).unsqueeze(-1)  # [E_global, T, 1]
+
+            e0 = int(self.experts_min)
+            e1 = e0 + E_local
+            experts_mask_local = experts_mask[e0:e1, ...]  # [E_local, T, 1]
+
+            # ------------------------------------------------------------
+            # 3) First batched GEMM：gate_up = x @ W13^T
+            #    torch.mm： x to [1,T,H]，W13^T to [E,H,2D], broadcast matmul
+            # ------------------------------------------------------------
+            xE = hidden_states.unsqueeze(0)  # [1,T,H]
+            W13_T = W13.transpose(1, 2)                              # [E,H,2D]
+
+            gate_up = (xE @ W13_T).contiguous()                      # [E,T,2D]
+
+            # ------------------------------------------------------------
+            # 4) activation：shape is [E,T,D]
+            # ------------------------------------------------------------
+            ff = self.custom_gateup_activation(gate_up, limit=7.0)  # [E,T,D]
+
+            # ------------------------------------------------------------
+            # 5) Second batched GEMM：y = ff @ W2^T -> [E,T,H]
+            #    W2: [E,H,D] => W2^T: [E,D,H]
+            # ------------------------------------------------------------
+            W2_T = W2.transpose(1, 2)  # [E,D,H]
+            y = torch.bmm(ff, W2_T).contiguous()                  # [E,T,H]
+
+            # ------------------------------------------------------------
+            # 6) sum experts：out = sum_e (y_e * mask_e)
+            # ------------------------------------------------------------
+            out = (y * experts_mask_local).sum(dim=0)  # [T,H]
+        if self.moe_n_slice == 1 and activation != "swiglustep":
             if self.bias is not None:
                 w1_bias_list = [self.w13_list[i].bias.squeeze() for i in experts_range]
                 w2_bias_list = [self.w2_list[i].bias.squeeze() for i in experts_range]
@@ -653,43 +728,46 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
                                                         experts_min=self.experts_min,
                                                         experts_max=self.experts_max,
                                                         **kwargs)
-        for i in range(self.moe_n_slice):
-            w1_list_slice = w1_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
-            w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
-            min_expert = self.experts_min + i * self.num_expert_per_group
-            max_expert = min_expert + self.num_expert_per_group - 1
-            if self.bias is not None:
-                w1_bias_list = [self.w13_list[i].bias.squeeze() for i in experts_range]
-                w2_bias_list = [self.w2_list[i].bias.squeeze() for i in experts_range]
-                w1_bias_list_slice = w1_bias_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
-                w2_bias_list_slice = w2_bias_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
-                slice_final_hidden_states = torch.ops.hpu.mixture_of_experts.bias_fused_weights(
-                    hidden_states=hidden_states,
-                    expert_routing_table=expert_routing_table,
-                    router_weights=router_weights,
-                    w12=w1_list,
-                    w3=w2_list,
-                    w12_bias=w1_bias_list_slice,
-                    w3_bias=w2_bias_list_slice,
-                    permuted_weights=permuted_weights,
-                    experts_min=self.experts_min,
-                    experts_max=self.experts_max)
-            else:
-                slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
-                                                                             expert_routing_table=expert_routing_table,
-                                                                             router_weights=router_weights,
-                                                                             w12=w1_list_slice,
-                                                                             w3=w2_list_slice,
-                                                                             permuted_weights=permuted_weights,
-                                                                             activation=activation,
-                                                                             experts_min=min_expert,
-                                                                             experts_max=max_expert,
-                                                                             **kwargs)
-            if i == 0:
-                final_hidden_states = slice_final_hidden_states
-            else:
-                final_hidden_states += slice_final_hidden_states
-            htorch.core.mark_step()
+        if(activation != "swiglustep"):
+            for i in range(self.moe_n_slice):
+                w1_list_slice = w1_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                min_expert = self.experts_min + i * self.num_expert_per_group
+                max_expert = min_expert + self.num_expert_per_group - 1
+                if self.bias is not None:
+                    w1_bias_list = [self.w13_list[i].bias.squeeze() for i in experts_range]
+                    w2_bias_list = [self.w2_list[i].bias.squeeze() for i in experts_range]
+                    w1_bias_list_slice = w1_bias_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                    w2_bias_list_slice = w2_bias_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
+                    slice_final_hidden_states = torch.ops.hpu.mixture_of_experts.bias_fused_weights(
+                        hidden_states=hidden_states,
+                        expert_routing_table=expert_routing_table,
+                        router_weights=router_weights,
+                        w12=w1_list,
+                        w3=w2_list,
+                        w12_bias=w1_bias_list_slice,
+                        w3_bias=w2_bias_list_slice,
+                        permuted_weights=permuted_weights,
+                        experts_min=self.experts_min,
+                        experts_max=self.experts_max)
+                else:
+                    slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
+                                                                                expert_routing_table=expert_routing_table,
+                                                                                router_weights=router_weights,
+                                                                                w12=w1_list_slice,
+                                                                                w3=w2_list_slice,
+                                                                                permuted_weights=permuted_weights,
+                                                                                activation=activation,
+                                                                                experts_min=min_expert,
+                                                                                experts_max=max_expert,
+                                                                                **kwargs)
+                if i == 0:
+                    final_hidden_states = slice_final_hidden_states
+                else:
+                    final_hidden_states += slice_final_hidden_states
+                htorch.core.mark_step()
+        else: # activation == "swiglustep"
+            final_hidden_states = out
         return final_hidden_states
 
 
@@ -1042,14 +1120,55 @@ def fp8_channel_moe_prepare_weights(layer):
                 When weight scale is per tensor quantized, w1 and w3 are combined so the shape of their weight scales become [2],
                 but MoE requires [2 * out_channels], so it has to be reshaped as [2, 1],
                 and repeated to [2, out_channels] and then flattened to [2 * out_channels].
-                '''
+            '''
             layer.moe_op.w13_list[index].set_scale_inv_fp8(layer.moe_op.w13_list[index].scale_inv_fp8.reshape(
                 2, 1).repeat(1, layer.w13_weight.shape[1] // 2).flatten().clone())
-
+    '''
     del layer.w13_weight
     del layer.w2_weight
     setattr(layer, "w13_weight", None)
     setattr(layer, "w2_weight", None)
+    '''
+    _, _, hidden_size = layer.w13_weight.shape
+    layer.moe_op.w13_raw_fp8 = layer.w13_weight.reshape(-1, hidden_size).contiguous()
+    layer.moe_op.w2_raw_fp8 = layer.w2_weight
+
+
+    twoD = layer.w13_weight.shape[1]  # weight shape that contain gatr and up
+    D = twoD // 2
+
+    # w13_weight_scale: [E,2]  (gate_scale, up_scale)
+    s2 = layer.w13_weight_scale
+
+    # -> [E, 2D] by repeating each half
+    s_per_channel = torch.cat(
+        [s2[:, 0:1].repeat(1, D),  # gate half
+        s2[:, 1:2].repeat(1, D)], # up half
+        dim=1
+    )  # [E,2D]
+    layer.moe_op.w13_raw_fp8_scale = s_per_channel.reshape(-1).contiguous()
+
+    #
+    E, H, D = layer.w2_weight.shape
+    s = layer.w2_weight_scale
+
+    if s.dim() == 1 and s.numel() == E:
+        # [E] -> [E,1,H]
+        W2s = s.view(E, 1, 1).repeat(1, 1, H).contiguous()
+    elif s.dim() == 2 and s.shape == (E, 1):
+        # [E,1] -> [E,1,H]
+        W2s = s.view(E, 1, 1).repeat(1, 1, H).contiguous()
+    elif s.dim() == 2 and s.shape == (E, H):
+        # [E,H] -> [E,1,H]
+        W2s = s.unsqueeze(1).contiguous()
+    elif s.dim() == 1 and s.numel() == H:
+        # [H] -> [1,1,H]
+        W2s = s.view(1, 1, H).contiguous()
+    else:
+        raise RuntimeError(f"Unexpected w2_weight_scale shape: {tuple(s.shape)}")
+
+    layer.moe_op.w2_raw_fp8_scale = W2s
+
     if hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None:
         layer.moe_op.w13_input_scale = layer.w13_input_scale
     if hasattr(layer, "w2_input_scale") and layer.w2_input_scale is not None:
@@ -1207,6 +1326,24 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self.w2_input_scale = None
         self.enable_unit_moe = get_config().enable_unit_moe
 
+        self.w13_raw_fp8 = None
+        self.w2_raw_fp8 = None
+
+        self.w13_raw_fp8_scale = None
+        self.w2_raw_fp8_scale = None
+
+
+    def custom_gateup_activation(self, gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+        """
+        gate_up: [N, 2*D] (last dim is the concated gate and up )
+        return:  [N, D]
+        """
+        gate, up = gate_up.chunk(2, dim=-1)     # chunk last dim
+        gate = F.silu(gate)
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        return gate * up
+
     def forward(
         self,
         x,
@@ -1228,7 +1365,104 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
             w13_weight_scale = [self.w13_list[i].scale_inv_fp8 for i in experts_range]
             w2_weight_scale = [self.w2_list[i].scale_inv_fp8 for i in experts_range]
 
-        if self.w13_input_scale is None:
+        if (activation == "swiglustep"):
+            T, H = x.shape
+            dtype = x.dtype
+            device = x.device
+
+            # require given scales (no dynamic_quant)
+            if self.w13_input_scale is None:
+                raise RuntimeError("w13_input_scale is None, but this loop requires given input scale.")
+            if self.w2_input_scale is None:
+                raise RuntimeError("w2_input_scale is None, but this loop requires given input scale.")
+
+            # x -> fp8 (once)
+            x_scale = self.w13_input_scale.data
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                x, 1.0 / x_scale, False, False, torch.float8_e4m3fn
+            )[0]
+
+            # experts_mask: [E_global, T, 1]
+            experts_mask = torch.zeros((T, self.global_num_experts), dtype=dtype, device=device)
+            experts_mask.scatter_(-1, topk_ids.long(), topk_weights.to(dtype))
+            experts_mask = experts_mask.transpose(0, 1).unsqueeze(-1)
+            e0 = int(self.experts_min)
+            E_local = len(self.w13_list)
+            e1 = e0 + E_local
+            experts_mask_local = experts_mask[e0:e1, ...]
+
+            out = torch.zeros((T, H), dtype=dtype, device=device)
+
+            # -------------------------
+            # W13: single GEMM with flattened weight
+            #   W13_flat: [E*2D, H]
+            #   W13s_flat: [E*2D]
+            #   gate_up_full: [T, E*2D]
+            #   gate_up: [E, T, 2D]
+            # -------------------------
+            W13_flat = self.w13_raw_fp8
+            W13s_flat = self.w13_raw_fp8_scale
+
+            E = self.num_experts
+            twoD = W13_flat.shape[0] // E
+            D = twoD // 2
+
+            gate_up_full = torch.ops.hpu.fp8_gemm_v2(
+                A=x_fp8,            # [T,H]
+                trans_A=False,
+                B=W13_flat,         # [E*2D,H]
+                trans_B=True,
+                D=None,
+                out_dtype=torch.bfloat16,
+                A_scale_inv=x_scale,
+                B_scale_inv=W13s_flat,  # [E*2D] or [E]
+                bias=None,
+                accumulate=False,
+            )  # expected [T, E*2D]
+
+            # reshape to per-expert layout expected by the rest of the code
+            # gate_up[e] => [T, 2D]
+            gate_up = gate_up_full.view(T, E, twoD).permute(1, 0, 2).contiguous()  # [E,T,2D]
+
+            # -------------------------
+            # activation -> ff_all [E_local,T,D] (vectorized)
+            # -------------------------
+            ff = self.custom_gateup_activation(gate_up, limit=7.0)  # must support 3D input
+
+            # -------------------------
+            # cast ff to fp8 with per-expert scale -> ff_fp8 [E_local,T,D]
+            # -------------------------
+            w2_scale = self.w2_input_scale
+            w2_scale_b = w2_scale.view(E_local, 1, 1)  # broadcast to [E,T,D]
+            ff_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                ff, 1.0 / w2_scale_b, False, False, torch.float8_e4m3fn
+            )[0]  # [E,T,D] fp8
+
+            # -------------------------
+            # W2 batch GEMM: y = ff @ W2^T -> [E,T,H]
+            # -------------------------
+            W2 = self.w2_raw_fp8  # expected [E_local, H, D] fp8
+            W2s = self.w2_raw_fp8_scale
+
+            y = torch.ops.hpu.fp8_gemm_v2(
+                A=ff_fp8,            # [E,T,D]
+                trans_A=False,
+                B=W2,                # [E,H,D]
+                trans_B=True,
+                D=None,
+                out_dtype=torch.bfloat16,
+                A_scale_inv=w2_scale_b,
+                B_scale_inv=W2s,
+                bias=None,
+                accumulate=False,
+            )  # expect [E,T,H]
+
+            # -------------------------
+            # route-weight + sum -> [T,H]
+            # -------------------------
+            out = (y * experts_mask_local).sum(dim=0)  # [T,H]
+
+        if self.w13_input_scale is None and activation != "swiglustep":
             x_fp8, x_scale = dynamic_quant(x)
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
                                                                    expert_routing_table=topk_ids.to(torch.int64),
@@ -1243,7 +1477,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    experts_min=self.experts_min,
                                                                    experts_max=self.experts_max,
                                                                    **kwargs)
-        else:
+
+        elif(activation != "swiglustep"):
             if self.enable_unit_moe:
                 x_scale = 1.0
                 w2_input_scale = [1.0 for i in experts_range]
@@ -1251,6 +1486,9 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                 x_scale = self.w13_input_scale.data
                 # w2_input_scale should be List[Tensor] when static and fused
                 w2_input_scale = self.w2_input_scale
+            x_scale = self.w13_input_scale.data
+            # w2_input_scale should be List[Tensor] when static and fused
+            w2_input_scale = [self.w2_input_scale[i] for i in range(self.num_experts)]
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
                                                                    expert_routing_table=topk_ids.to(torch.int64),
@@ -1266,7 +1504,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    experts_min=self.experts_min,
                                                                    experts_max=self.experts_max,
                                                                    **kwargs)
-
+        if(activation == "swiglustep"):
+            final_hidden_states = out
         return final_hidden_states
 
 
