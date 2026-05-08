@@ -1420,7 +1420,6 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w2_weight_scale = self._cached_w2_scale_views
 
         if(activation != "silu"):
-            print("enter")
             T, H = x.shape
             dtype = x.dtype
             device = x.device
