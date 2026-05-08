@@ -1358,6 +1358,12 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self.w13_input_scale = None
         self.w2_input_scale = None
 
+        self.w13_raw_fp8 = None
+        self.w2_raw_fp8 = None
+
+        self.w13_raw_fp8_scale = None
+        self.w2_raw_fp8_scale = None
+
         # cached views to avoid rebuilding lists every forward
         self._cached_w13_views = None
         self._cached_w2_views = None
@@ -1382,6 +1388,17 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         self._cache_weight_lists()
         return ret
 
+    def custom_gateup_activation(self, gate_up: torch.Tensor, limit: float) -> torch.Tensor:
+        """
+        gate_up: [N, 2*D] (last dim is the concated gate and up )
+        return:  [N, D]
+        """
+        gate, up = gate_up.chunk(2, dim=-1)     # chunk last dim
+        gate = F.silu(gate)
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        return gate * up
+
     def forward(
         self,
         x,
@@ -1391,7 +1408,7 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         activation="silu",
     ):
         tokens_num, _ = x.shape
-        activation = _as_activation_str(activation)
+        # activation = _as_activation_str(activation)
         kwargs = self._get_extra_kwargs(tokens_num)
 
         if self._cached_w13_views is None or self._cached_w2_views is None:
@@ -1402,7 +1419,89 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w13_weight_scale = self._cached_w13_scale_views
         w2_weight_scale = self._cached_w2_scale_views
 
-        if self.w13_input_scale is None:
+        if(activation != "silu"):
+            print("enter")
+            T, H = x.shape
+            dtype = x.dtype
+            device = x.device
+
+            if self._cached_w13_views is None or self._cached_w2_views is None:
+                self._cache_weight_lists()
+
+            # require given scales (no dynamic_quant)
+            if self.w13_input_scale is None:
+                raise RuntimeError("w13_input_scale is None, but this loop requires given input scale.")
+            if self.w2_input_scale is None:
+                raise RuntimeError("w2_input_scale is None, but this loop requires given input scale.")
+
+            x_scale = self.w13_input_scale.data
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                x, 1.0 / x_scale, False, False, torch.float8_e4m3fn
+            )[0]
+
+            # experts_mask: [E_global, T, 1]
+            experts_mask = torch.zeros((T, self.global_num_experts), dtype=dtype, device=device)
+            experts_mask.scatter_(-1, topk_ids.long(), topk_weights.to(dtype))
+            experts_mask = experts_mask.transpose(0, 1).unsqueeze(-1)
+
+            out = torch.zeros((T, H), dtype=dtype, device=device)
+
+            for local_e in range(self.num_experts):
+                global_eid = int(self.experts_min) + local_e
+
+                W13_e = self._cached_w13_views[local_e]
+                W13_s = self._cached_w13_scale_views[local_e]
+                W2_e  = self._cached_w2_views[local_e]
+                W2_s  = self._cached_w2_scale_views[local_e]
+
+                gate_up = torch.ops.hpu.fp8_gemm_v2(
+                    A=x_fp8,
+                    trans_A=False,
+                    B=W13_e,
+                    trans_B=True,
+                    D=None,
+                    out_dtype=torch.bfloat16,
+                    A_scale_inv=x_scale,
+                    B_scale_inv=W13_s,
+                    bias=None,
+                    accumulate=False,
+                )
+
+                if activation == "silu":
+                    d = gate_up.shape[-1] // 2
+                    ff = F.silu(gate_up[..., :d]) * gate_up[..., d:]
+                else:
+                    ff = self.custom_gateup_activation(gate_up, limit=7.0)
+
+                # per-expert given w2 input scale
+                if isinstance(self.w2_input_scale, (list, tuple)):
+                    w2_in_scale = self.w2_input_scale[local_e]
+                else:
+                    if self.w2_input_scale.numel() == self.num_experts:
+                        w2_in_scale = self.w2_input_scale[local_e]
+                    else:
+                        w2_in_scale = self.w2_input_scale
+
+                ff_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                    ff, 1.0 / w2_in_scale, False, False, torch.float8_e4m3fn
+                )[0]
+
+                y = torch.ops.hpu.fp8_gemm_v2(
+                    A=ff_fp8,
+                    trans_A=False,
+                    B=W2_e,
+                    trans_B=True,
+                    D=None,
+                    out_dtype=torch.bfloat16,
+                    A_scale_inv=w2_in_scale,
+                    B_scale_inv=W2_s,
+                    bias=None,
+                    accumulate=False,
+                )
+
+                out = out + y * experts_mask[global_eid]  # non-inplace
+
+        if self.w13_input_scale is None and activation == "silu":
             x_fp8, x_scale = dynamic_quant(x)
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
                                                                    expert_routing_table=topk_ids.to(torch.int64),
@@ -1417,7 +1516,7 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    experts_min=self.experts_min,
                                                                    experts_max=self.experts_max,
                                                                    **kwargs)
-        else:
+        elif(activation == "silu"):
             x_scale = self.w13_input_scale.data
             # w2_input_scale should be List[Tensor] when static and fused
             w2_input_scale = [self.w2_input_scale[i] for i in range(self.num_experts)]
@@ -1436,7 +1535,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    experts_min=self.experts_min,
                                                                    experts_max=self.experts_max,
                                                                    **kwargs)
-
+        if(activation != "silu"):
+            final_hidden_states = out
         return final_hidden_states
 
 
