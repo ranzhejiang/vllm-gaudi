@@ -1208,6 +1208,46 @@ def fp8_channel_moe_prepare_weights(layer):
             layer.moe_op.w13_list[index].set_scale_inv_fp8(layer.moe_op.w13_list[index].scale_inv_fp8.reshape(
                 2, 1).repeat(1, layer.w13_weight.shape[1] // 2).flatten().clone())
 
+    _, _, hidden_size = layer.w13_weight.shape
+    layer.moe_op.w13_raw_fp8 = layer.w13_weight.reshape(-1, hidden_size).contiguous()
+    layer.moe_op.w2_raw_fp8 = layer.w2_weight
+
+
+    twoD = layer.w13_weight.shape[1]  # 2560 (如果你有这个维度)，否则从 W13_flat 推
+    D = twoD // 2  # 1280
+
+    # w13_weight_scale: [E,2]  (gate_scale, up_scale)
+    s2 = layer.w13_weight_scale  # torch.Size([36,2])
+
+    # -> [E, 2D] by repeating each half
+    s_per_channel = torch.cat(
+        [s2[:, 0:1].repeat(1, D),  # gate half
+        s2[:, 1:2].repeat(1, D)], # up half
+        dim=1
+    )  # [E,2D] = [36,2560]
+    layer.moe_op.w13_raw_fp8_scale = s_per_channel.reshape(-1).contiguous()
+
+    # 假设 layer.w2_weight_scale 是 [E] 或 [E,1] 或 [E,H] 或 [H]
+    E, H, D = layer.w2_weight.shape  # [36,4096,1280]
+    s = layer.w2_weight_scale
+
+    if s.dim() == 1 and s.numel() == E:
+        # [E] -> [E,1,H]
+        W2s = s.view(E, 1, 1).repeat(1, 1, H).contiguous()
+    elif s.dim() == 2 and s.shape == (E, 1):
+        # [E,1] -> [E,1,H]
+        W2s = s.view(E, 1, 1).repeat(1, 1, H).contiguous()
+    elif s.dim() == 2 and s.shape == (E, H):
+        # [E,H] -> [E,1,H]
+        W2s = s.unsqueeze(1).contiguous()
+    elif s.dim() == 1 and s.numel() == H:
+        # [H] -> [1,1,H]（共享）
+        W2s = s.view(1, 1, H).contiguous()
+    else:
+        raise RuntimeError(f"Unexpected w2_weight_scale shape: {tuple(s.shape)}")
+
+    layer.moe_op.w2_raw_fp8_scale = W2s # 期望 [E,1,H] 或 [1,1,H]
+
     if hasattr(layer, "w13_input_scale"):
         layer.moe_op.w13_input_scale = layer.w13_input_scale
     if hasattr(layer, "w2_input_scale"):
@@ -1418,8 +1458,131 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w2_list = self._cached_w2_views
         w13_weight_scale = self._cached_w13_scale_views
         w2_weight_scale = self._cached_w2_scale_views
+        use_loop = False
+        if (activation != "silu" and not use_loop):
+            T, H = x.shape
+            dtype = x.dtype
+            device = x.device
 
-        if(activation != "silu"):
+            if self._cached_w13_views is None or self._cached_w2_views is None:
+                self._cache_weight_lists()
+
+            # require given scales (no dynamic_quant)
+            if self.w13_input_scale is None:
+                raise RuntimeError("w13_input_scale is None, but this loop requires given input scale.")
+            if self.w2_input_scale is None:
+                raise RuntimeError("w2_input_scale is None, but this loop requires given input scale.")
+
+            # x -> fp8 (once)
+            x_scale = self.w13_input_scale.data
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                x, 1.0 / x_scale, False, False, torch.float8_e4m3fn
+            )[0]
+
+            # experts_mask: [E_global, T, 1]
+            experts_mask = torch.zeros((T, self.global_num_experts), dtype=dtype, device=device)
+            experts_mask.scatter_(-1, topk_ids.long(), topk_weights.to(dtype))
+            experts_mask = experts_mask.transpose(0, 1).unsqueeze(-1)
+            e0 = int(self.experts_min)
+            E_local = len(self.w13_list)
+            e1 = e0 + E_local
+            experts_mask_local = experts_mask[e0:e1, ...]
+
+            out = torch.zeros((T, H), dtype=dtype, device=device)
+
+            # -------------------------
+            # W13: single GEMM with flattened weight (NO A expand, NO for-loop for W13)
+            #   W13_flat: [E*2D, H]
+            #   W13s_flat: [E*2D]
+            #   gate_up_big: [T, E*2D]
+            #   gate_up_all: [E, T, 2D]
+            # -------------------------
+            W13_flat = self.w13_raw_fp8.contiguous()  # e.g. [92160, 4096]
+            W13s_flat = self.w13_raw_fp8_scale
+
+            E = self.num_experts
+            if W13_flat.dim() != 2 or W13_flat.shape[1] != H:
+                raise RuntimeError(f"Expected W13_flat shape [E*2D, H], got {tuple(W13_flat.shape)}")
+            if W13_flat.shape[0] % E != 0:
+                raise RuntimeError(f"W13_flat first dim {W13_flat.shape[0]} not divisible by num_experts {E}")
+            twoD = W13_flat.shape[0] // E  # 2D (=2560 in your logs)
+            D = twoD // 2
+
+            # If scales are per-channel, they must match E*2D; if per-expert scalar, they must match E.
+            if torch.is_tensor(W13s_flat):
+                if W13s_flat.numel() not in (E, E * twoD):
+                    raise RuntimeError(
+                        f"W13 scale numel mismatch: got {W13s_flat.numel()}, expected {E} (per-expert) or {E*twoD} (per-channel)"
+                    )
+
+            gate_up_big = torch.ops.hpu.fp8_gemm_v2(
+                A=x_fp8,            # [T,H] (do NOT expand)
+                trans_A=False,
+                B=W13_flat,         # [E*2D,H]
+                trans_B=True,
+                D=None,
+                out_dtype=torch.bfloat16,
+                A_scale_inv=x_scale,
+                B_scale_inv=W13s_flat,  # [E*2D] or [E]
+                bias=None,
+                accumulate=False,
+            )  # expected [T, E*2D]
+
+            # reshape to per-expert layout expected by the rest of the code
+            # gate_up_all[e] => [T, 2D]
+            gate_up = gate_up_big.view(T, E, twoD).permute(1, 0, 2).contiguous()  # [E,T,2D]
+
+            # -------------------------
+            # activation -> ff_all [E_local,T,D] (vectorized)
+            # -------------------------
+            if activation == "silu":
+                gate, up = gate_up.split(D, dim=-1)
+                ff = F.silu(gate) * up
+            else:
+                ff = self.custom_gateup_activation(gate_up, limit=7.0)  # must support 3D input
+                if ff.shape != (E_local, T, D):
+                    raise RuntimeError(f"custom_gateup_activation must return [E,T,D]={E_local,T,D}, got {tuple(ff.shape)}")
+
+            # -------------------------
+            # cast ff to fp8 with per-expert scale -> ff_fp8 [E_local,T,D]
+            # -------------------------
+            w2_scale = self.w2_input_scale
+            if not (torch.is_tensor(w2_scale) and w2_scale.numel() == E_local):
+                raise RuntimeError(f"w2_input_scale must be a tensor with numel==E_local ({E_local}), got {type(w2_scale)} / {getattr(w2_scale,'shape',None)}")
+
+            w2_scale_b = w2_scale.view(E_local, 1, 1)  # broadcast to [E,T,D]
+
+            ff_fp8 = torch.ops.hpu.cast_to_fp8_v2(
+                ff, 1.0 / w2_scale_b, False, False, torch.float8_e4m3fn
+            )[0]  # [E,T,D] fp8
+
+            # -------------------------
+            # W2 batch GEMM: y = ff @ W2^T -> [E,T,H]
+            # -------------------------
+            W2 = self.w2_raw_fp8  # expected [E_local, H, D] fp8 (or whatever fp8_gemm_v2 expects as B)
+            if W2.dim() != 3 or W2.shape[0] != E_local or W2.shape[1] != H or W2.shape[2] != D:
+                raise RuntimeError(f"W2 expected [E,H,D]=[{E_local},{H},{D}], got {tuple(W2.shape)}")
+
+            W2s = self.w2_raw_fp8_scale  # should be [E_local] or [E_local,H] depending on your quantization
+
+            y = torch.ops.hpu.fp8_gemm_v2(
+                A=ff_fp8,            # [E,T,D]
+                trans_A=False,
+                B=W2,                # [E,H,D]
+                trans_B=True,
+                D=None,
+                out_dtype=torch.bfloat16,
+                A_scale_inv=w2_scale_b,
+                B_scale_inv=W2s,
+                bias=None,
+                accumulate=False,
+            )  # expect [E,T,H]
+
+            # -------------------------
+            # route-weight + sum -> [T,H] (slice method, no index_select)
+            # -------------------------
+            out = (y * experts_mask_local).sum(dim=0)  # [T,H]
+        elif(activation != "silu" and use_loop):
             T, H = x.shape
             dtype = x.dtype
             device = x.device
