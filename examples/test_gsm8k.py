@@ -17,7 +17,6 @@ def main():
     ]
     sampling_params = SamplingParams(temperature=0, max_tokens=1024)
     model = "/mnt/disk3/HF_models/Step-3.5-Flash"
-    # model = "/mnt/disk6/HF_models/Hunyuan-A13B-Instruct-FP8-G2"
     # model = "/mnt/weka/llm/DeepSeek-V2-Lite-Chat/"
     # model = "/mnt/weka/data/mlperf_models/Mixtral-8x7B-Instruct-v0.1"
     # model = "/mnt/weka/data/pytorch/llama3.1/Meta-Llama-3.1-8B/"
